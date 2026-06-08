@@ -25,6 +25,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <dirent.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
@@ -43,6 +44,7 @@
 #include "usb_helpers.h"
 #include "controller_nintendo.h"
 #include "controller_xbox.h"
+#include "controller_ds4.h"
 
 /* ── Logging ──────────────────────────────────────────────────────────── */
 #define LOG_DIR  "/data/ghostpad"
@@ -225,21 +227,68 @@ static void inject_pad(int slot, const ScePadData *pad) {
 #define VID_XBOX    0x045eu
 #define PID_XBOX    0x02eau
 
-static const char *UGEN_PATHS[] = {
-    "/dev/ugen2.2","/dev/ugen2.3","/dev/ugen2.4","/dev/ugen2.5",
-    "/dev/ugen2.6","/dev/ugen2.7","/dev/ugen2.8","/dev/ugen2.9",
-    "/dev/ugen1.2","/dev/ugen0.2","/dev/ugen0.3",
-};
-#define N_UGEN_PATHS ((int)(sizeof(UGEN_PATHS)/sizeof(UGEN_PATHS[0])))
+/* Path list is now built dynamically per scan from /dev — see manager loop. */
 
-/* Probe one ugen2.x path to identify controller type.
+/* Match a (vid,pid) against our supported controller table.
+ * Returns 1 if recognized — fills out_vid/out_pid even if PID is unknown
+ * (so DS4-family clones with novel PIDs still hit the DS4 path). */
+static int match_known_vidpid(uint16_t vid, uint16_t pid,
+                              uint16_t *out_vid, uint16_t *out_pid) {
+    if (vid == VID_SWITCH || vid == VID_NATIVE ||
+        vid == VID_XBOX   ||
+        vid == VID_SONY   || vid == VID_HORI) {
+        *out_vid = vid; *out_pid = pid;
+        return 1;
+    }
+    return 0;
+}
+
+/* Probe a /dev/ugen* path to identify controller type.
  * Returns 1 with vid/pid set, 0 if not a known controller.
- * Skips non-ugen2 paths (not on external USB bus). */
+ *
+ * The descriptor-read path (USB_GET_DEVICEINFO) is non-destructive and
+ * runs on any bus. The endpoint-topology fallback IS destructive
+ * (DRIVER_DETACH + FS_OPEN) and only runs on ugen2.* — internal buses
+ * (ugen0/1) hold the disc drive controller and other system devices that
+ * must not be detached. */
 static int probe_one_path(const char *path, uint16_t *out_vid, uint16_t *out_pid) {
-    if (strncmp(path, "/dev/ugen2.", 11) != 0) return 0;
-
     int fd = open(path, O_RDWR|O_NONBLOCK);
     if (fd < 0) return 0;
+
+    /* Safe path: read device descriptor. Works on any bus.
+     * PS5 ugen driver does NOT implement USB_GET_DEVICEINFO (errno 25),
+     * but USB_GET_DEVICE_DESC works — returns the raw USB descriptor with
+     * idVendor/idProduct as little-endian uWord arrays.
+     *
+     * IMPORTANT: if the descriptor ioctl succeeds we MUST NOT fall through
+     * to the destructive endpoint probe below, even if the VID/PID isn't a
+     * recognized controller. The fallback calls USB_IFACE_DRIVER_DETACH on
+     * interfaces 0..2 which yanks whatever driver currently owns the device
+     * — e.g. the mass-storage driver for an external HDD. PS5 doesn't
+     * auto-reattach. */
+    int desc_ok = 0;
+    {
+        struct usb_device_descriptor desc;
+        memset(&desc, 0, sizeof(desc));
+        if (ioctl(fd, USB_GET_DEVICE_DESC, &desc) == 0) {
+            uint16_t vid = UGETW(desc.idVendor);
+            uint16_t pid = UGETW(desc.idProduct);
+            desc_ok = 1;
+            gp_log("scan: %s VID=0x%04x PID=0x%04x\n", path, vid, pid);
+            if (match_known_vidpid(vid, pid, out_vid, out_pid)) {
+                close(fd);
+                return 1;
+            }
+        } else {
+            gp_log("scan: %s USB_GET_DEVICE_DESC errno=%d\n", path, errno);
+        }
+    }
+    if (desc_ok) { close(fd); return 0; }
+
+    /* Destructive fallback: only when descriptor ioctl itself failed AND on
+     * external bus. On PS5 the descriptor path always works, so this is
+     * effectively dead code — kept as a safety net for unknown firmwares. */
+    if (strncmp(path, "/dev/ugen2.", 11) != 0) { close(fd); return 0; }
 
     struct usb_fs_endpoint ep;
     struct usb_fs_init ini;
@@ -357,6 +406,60 @@ static void *usb_hid_thread(void *arg) {
     gp_log("slot[%d] USB thread: %s VID=0x%04x PID=0x%04x\n",
            slot, dev_path, vid, pid);
 
+    /* ── DS4 / HORIPAD / XIM4: single-pass, no handshake ──────────────── */
+    if (vid == VID_SONY || vid == VID_HORI) {
+        fd = open(dev_path, O_RDWR);
+        if (fd < 0) { gp_log("slot[%d] DS4 open fail errno=%d\n", slot, errno); goto exit_slot; }
+
+        { int ii; for(ii=0;ii<4;ii++){int i2=ii; ioctl(fd,USB_IFACE_DRIVER_DETACH,&i2);} }
+        usleep(100000);
+
+        memset(eps,0,sizeof(eps)); memset(&init,0,sizeof(init));
+        init.pEndpoints=eps; init.ep_index_max=2;
+        if (ioctl(fd,USB_FS_INIT,&init)!=0){
+            gp_log("slot[%d] DS4 FS_INIT fail errno=%d\n",slot,errno);
+            close(fd); goto exit_slot;
+        }
+
+        /* Try DS4 IN ep 0x84 first (real Sony DS4); fall back to 0x81 (HORI). */
+        memset(&fs_open,0,sizeof(fs_open));
+        fs_open.ep_index=0; fs_open.ep_no=DS4_EP_IN;
+        fs_open.max_bufsize=64; fs_open.max_frames=1;
+        int in_ok = (ioctl(fd,USB_FS_OPEN,&fs_open)==0);
+        if (!in_ok) {
+            memset(&fs_open,0,sizeof(fs_open));
+            fs_open.ep_index=0; fs_open.ep_no=DS4_EP_IN_ALT;
+            fs_open.max_bufsize=64; fs_open.max_frames=1;
+            in_ok = (ioctl(fd,USB_FS_OPEN,&fs_open)==0);
+            if (in_ok) gp_log("slot[%d] DS4 IN ep=0x81 (HORI/clone)\n", slot);
+        } else {
+            gp_log("slot[%d] DS4 IN ep=0x84 (Sony)\n", slot);
+        }
+        if (!in_ok) {
+            gp_log("slot[%d] DS4 IN fail errno=%d\n",slot,errno);
+            goto uninit_exit;
+        }
+        gp_log("slot[%d] DS4 IN maxpkt=%u\n", slot, (unsigned)fs_open.max_packet_length);
+
+        buffers[0]=buf; lengths[0]=64;
+        eps[0].ppBuffer=buffers; eps[0].pLength=lengths; eps[0].nFrames=1;
+        eps[0].timeout=50; eps[0].flags=USB_FS_FLAG_SINGLE_SHORT_OK|USB_FS_FLAG_MULTI_SHORT_OK;
+
+        /* OUT endpoint is optional — XIM4 is input-only, no rumble feedback. */
+        memset(&fs_open,0,sizeof(fs_open));
+        fs_open.ep_index=1; fs_open.ep_no=DS4_EP_OUT;
+        fs_open.max_bufsize=64; fs_open.max_frames=1;
+        out_opened = (ioctl(fd,USB_FS_OPEN,&fs_open)==0) ? 1 : 0;
+        if (!out_opened) {
+            memset(&fs_open,0,sizeof(fs_open));
+            fs_open.ep_index=1; fs_open.ep_no=DS4_EP_OUT_ALT;
+            fs_open.max_bufsize=64; fs_open.max_frames=1;
+            out_opened = (ioctl(fd,USB_FS_OPEN,&fs_open)==0) ? 1 : 0;
+        }
+        gp_log("slot[%d] DS4 OUT opened=%d\n", slot, out_opened);
+        goto main_loop;
+    }
+
     /* ── Xbox One: single-pass ─────────────────────────────────────────── */
     if (pid == PID_XBOX) {
         fd = open(dev_path, O_RDWR);
@@ -464,7 +567,8 @@ static void *usb_hid_thread(void *arg) {
     }
 
 main_loop: ;
-    int hs_state = (pid==PID_XBOX) ? HS_STREAMING : HS_WAIT_81_01;
+    int is_ds4 = (vid == VID_SONY || vid == VID_HORI);
+    int hs_state = (pid==PID_XBOX || is_ds4) ? HS_STREAMING : HS_WAIT_81_01;
     uint8_t nintendo_seq = 1;
 
     while (1) {
@@ -506,7 +610,9 @@ main_loop: ;
         ScePadData pad; memset(&pad,0,sizeof(pad)); pad.quat.w=1.0f;
         int injected = 0;
 
-        if (pid == PID_XBOX) {
+        if (is_ds4) {
+            injected = ds4_handle_packet(fd, eps, buf, len, &pad);
+        } else if (pid == PID_XBOX) {
             injected = xbox_handle_packet(fd, eps, buf, len, &pad);
         } else {
             injected = nintendo_handle_packet(fd, eps, buf, len, &hs_state, &nintendo_seq, &pad);
@@ -559,11 +665,29 @@ static void *controller_manager_thread(void *arg) {
     gp_log("Manager thread started (MAX_SLOTS=%d)\n", MAX_SLOTS);
 
     while (1) {
-        for (int i = 0; i < N_UGEN_PATHS; i++) {
-            const char *path = UGEN_PATHS[i];
+        /* Snapshot every /dev/ugen*.* this scan pass — beats a hardcoded
+         * list when the XIM/controller lands on an unexpected path
+         * (ugen2.10+, ugen3.*, etc). Skip root hub (.1) entries. */
+        char ugen_paths[32][32];
+        int n_paths = 0;
+        DIR *dp = opendir("/dev");
+        if (dp) {
+            struct dirent *ent;
+            while (n_paths < 32 && (ent = readdir(dp)) != NULL) {
+                if (strncmp(ent->d_name, "ugen", 4) != 0) continue;
+                const char *dot = strchr(ent->d_name, '.');
+                if (!dot || dot[1] == '\0') continue;          /* not "ugenX.Y" */
+                if (strcmp(dot, ".1") == 0) continue;          /* root hub */
+                snprintf(ugen_paths[n_paths], sizeof(ugen_paths[0]),
+                         "/dev/%s", ent->d_name);
+                n_paths++;
+            }
+            closedir(dp);
+        }
+        if ((scan % 5) == 0) gp_log("manager: scan #%d — %d ugen paths\n", scan, n_paths);
 
-            /* Skip non-external-bus paths */
-            if (strncmp(path, "/dev/ugen2.", 11) != 0) continue;
+        for (int i = 0; i < n_paths; i++) {
+            const char *path = ugen_paths[i];
 
             /* Serialize assignment: if a controller is still awaiting the user's
              * button press to confirm its dialog, do not start another one. */
@@ -600,7 +724,10 @@ static void *controller_manager_thread(void *arg) {
             const char *name =
                 (vid==VID_SWITCH && pid==PID_SWITCH) ? "Nintendo Switch Pro / 8BitDo" :
                 (vid==VID_NATIVE && pid==PID_NATIVE) ? "8BitDo Native" :
-                (vid==VID_XBOX   && pid==PID_XBOX)   ? "Xbox One S" : "Unknown";
+                (vid==VID_XBOX   && pid==PID_XBOX)   ? "Xbox One S" :
+                (vid==VID_SONY)                       ? "DualShock 4" :
+                (vid==VID_HORI)                       ? "HORIPAD / DS4-compatible (XIM4)" :
+                                                        "Unknown";
 
             gp_log("manager: %s at %s → slot[%d]\n", name, path, slot);
             notify("Ghostcontrol: %s detected — assign user on screen", name);
