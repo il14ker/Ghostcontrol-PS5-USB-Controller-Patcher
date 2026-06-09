@@ -26,6 +26,7 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <dirent.h>
+#include <poll.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
@@ -45,6 +46,7 @@
 #include "controller_nintendo.h"
 #include "controller_xbox.h"
 #include "controller_ds4.h"
+#include "controller_logitech.h"
 
 /* ── Logging ──────────────────────────────────────────────────────────── */
 #define LOG_DIR  "/data/ghostpad"
@@ -245,8 +247,14 @@ static void inject_pad(int slot, const ScePadData *pad) {
  * Microsoft USB devices). */
 static int match_known_vidpid(uint16_t vid, uint16_t pid,
                               uint16_t *out_vid, uint16_t *out_pid) {
-    if (vid == VID_SWITCH || vid == VID_NATIVE ||
-        vid == VID_SONY   || vid == VID_HORI) {
+    if (vid == VID_SWITCH || vid == VID_NATIVE || vid == VID_LOGITECH) {
+        *out_vid = vid; *out_pid = pid;
+        return 1;
+    }
+    /* DS4 / DS4-protocol third-parties — Sony, HORI, and SDL's full PS4
+     * VID/PID table (Mad Catz, Razer, Nacon, Brook, Qanba, Victrix, etc).
+     * See DS4_EXTRA_PAIRS in controller_ds4.c. */
+    if (ds4_is_compatible_vidpid(vid, pid)) {
         *out_vid = vid; *out_pid = pid;
         return 1;
     }
@@ -434,15 +442,24 @@ static void *usb_hid_thread(void *arg) {
     struct usb_fs_close    fs_close;
     struct usb_fs_uninit   uninit;
     uint8_t  buf[64];
-    void    *buffers[1]; uint32_t lengths[1];
+    /* Multi-frame buffers — used by Logitech to queue N reads at once,
+     * keeping the kernel in "actively polling" mode so single sparse
+     * reports get buffered into available slots. */
+    void    *buffers[8]; uint32_t lengths[8];
+    int      n_frames = 1;
     int fd = -1, out_opened = 0;
     int usb_ready_notified = 0;
+    uint32_t in_mpkt = 64;  /* actual IN endpoint maxpkt — captured after open;
+                              defaulted to 64 for branches that don't set it */
 
     gp_log("slot[%d] USB thread: %s VID=0x%04x PID=0x%04x\n",
            slot, dev_path, vid, pid);
 
-    /* ── DS4 / HORIPAD / XIM4: single-pass, no handshake ──────────────── */
-    if (vid == VID_SONY || vid == VID_HORI) {
+    /* ── DS4 / HORIPAD / XIM4 / DS4-protocol third-parties / Logitech ──
+     * Identical open flow for all of them: detach driver, try IN 0x84 then
+     * fall back to 0x81. Logitech and HORI/XIM both land on 0x81 with no
+     * OUT endpoint. Dispatch in main_loop picks the right parser. */
+    if (ds4_is_compatible_vidpid(vid, pid) || vid == VID_LOGITECH) {
         fd = open(dev_path, O_RDWR);
         if (fd < 0) { gp_log("slot[%d] DS4 open fail errno=%d\n", slot, errno); goto exit_slot; }
 
@@ -475,8 +492,10 @@ static void *usb_hid_thread(void *arg) {
             goto uninit_exit;
         }
         gp_log("slot[%d] DS4 IN maxpkt=%u\n", slot, (unsigned)fs_open.max_packet_length);
+        in_mpkt = fs_open.max_packet_length ? fs_open.max_packet_length : 64;
 
-        buffers[0]=buf; lengths[0]=64;
+        n_frames = 1;
+        buffers[0]=buf; lengths[0]=in_mpkt;
         eps[0].ppBuffer=buffers; eps[0].pLength=lengths; eps[0].nFrames=1;
         eps[0].timeout=50; eps[0].flags=USB_FS_FLAG_SINGLE_SHORT_OK|USB_FS_FLAG_MULTI_SHORT_OK;
 
@@ -492,6 +511,13 @@ static void *usb_hid_thread(void *arg) {
             out_opened = (ioctl(fd,USB_FS_OPEN,&fs_open)==0) ? 1 : 0;
         }
         gp_log("slot[%d] DS4 OUT opened=%d\n", slot, out_opened);
+
+        /* Generic HID gamepads (Logitech etc.) may need a HID class wake-up
+         * before they start streaming reports. DS4 / HORI / XIM4 don't —
+         * they stream on enumeration. */
+        if (vid == VID_LOGITECH) {
+            logitech_wake_up(fd);
+        }
         goto main_loop;
     }
 
@@ -602,56 +628,121 @@ static void *usb_hid_thread(void *arg) {
     }
 
 main_loop: ;
-    int is_ds4 = (vid == VID_SONY || vid == VID_HORI);
-    int hs_state = (pid==PID_XBOX || is_ds4) ? HS_STREAMING : HS_WAIT_81_01;
+    int is_ds4      = ds4_is_compatible_vidpid(vid, pid);
+    int is_logitech = (vid == VID_LOGITECH);
+    int is_xbox     = (pid == PID_XBOX);
+    int hs_state    = (is_xbox || is_ds4 || is_logitech) ? HS_STREAMING : HS_WAIT_81_01;
     uint8_t nintendo_seq = 1;
     g_slots[slot].usb_fd = fd;  /* register fd for clean teardown on SIGTERM */
 
+    /* Cached pad state for sparse-report controllers (Logitech).
+     * PS5 seems to need continuous state updates to "lock in" a button
+     * state — a single inject_pad call gets dismissed. We re-inject the
+     * cached state on no-data poll() timeouts to keep PS5 actively seeing
+     * the input. CACHE_DECAY_ITERS short enough that fast successive
+     * presses aren't blocked by stale "pressed" state. */
+    ScePadData cached_pad; memset(&cached_pad, 0, sizeof(cached_pad));
+    cached_pad.quat.w = 1.0f;
+    cached_pad.leftStick.x  = 128; cached_pad.leftStick.y  = 128;
+    cached_pad.rightStick.x = 128; cached_pad.rightStick.y = 128;
+    int cache_valid = 0;
+    int no_data_count = 0;
+#define CACHE_DECAY_ITERS  2  /* ~100ms at 50ms cycle → 10Hz button rate ok */
+
     while (1) {
         memset(buf,0,64);
-        buffers[0]=buf; lengths[0]=64;
-        eps[0].ppBuffer=buffers; eps[0].pLength=lengths;
+        for (int fi = 0; fi < n_frames; fi++) {
+            buffers[fi] = buf + fi * in_mpkt;
+            lengths[fi] = in_mpkt;
+        }
+        eps[0].ppBuffer=buffers; eps[0].pLength=lengths; eps[0].nFrames=n_frames;
         eps[0].aFrames=0; eps[0].status=0;
 
+        /* Canonical FreeBSD ugen read pattern (see lib/libusb/libusb20_ugen20.c
+         * ugen20_tr_submit + libusb20_dev_wait_process + ugen20_process):
+         *   1. USB_FS_START
+         *   2. poll(fd, ...) — wait for completion event
+         *   3. USB_FS_COMPLETE — pick up the result
+         * No USB_FS_STOP needed between successful transfers; STOP is only
+         * for cancellation. Our old busy-poll + STOP approach was dropping
+         * sparse events because of gaps between cycles. */
         memset(&start,0,sizeof(start)); start.ep_index=0;
         if (ioctl(fd,USB_FS_START,&start)!=0) {
-            if (errno==EBUSY){
-                memset(&stop,0,sizeof(stop)); stop.ep_index=0; ioctl(fd,USB_FS_STOP,&stop);
-                usleep(5000);
-            } else if (errno==ENXIO||errno==ENOTTY){
-                gp_log("slot[%d] START errno=%d — device gone\n",slot,errno); goto reinit;
+            int e = errno;
+            if (e == EBUSY) {
+                /* Transfer still pending from prior iter — go straight to
+                 * poll+complete and pick it up. */
+            } else if (e == ENXIO || e == ENOTTY) {
+                gp_log("slot[%d] START errno=%d — device gone\n", slot, e);
+                goto reinit;
             } else {
-                gp_log("slot[%d] START fatal errno=%d\n",slot,errno); goto reinit;
+                gp_log("slot[%d] START fatal errno=%d\n", slot, e);
+                goto reinit;
             }
+        }
+
+        {
+            struct pollfd pfd;
+            pfd.fd = fd;
+            pfd.events = POLLIN | POLLOUT | POLLRDNORM | POLLWRNORM;
+            pfd.revents = 0;
+            int pr = poll(&pfd, 1, (int)eps[0].timeout);
+            if (pr <= 0) {
+                /* No event in the timeout window. Re-inject cached state
+                 * for Logitech to keep PS5 actively seeing the input
+                 * (single-shot injects get dismissed by PS5).
+                 *
+                 * Decay strategy: clear only BUTTONS (so missed release
+                 * events auto-recover) but HOLD the cached stick positions
+                 * (otherwise sticks snap to center mid-motion = stuttering).
+                 * Stick positions are corrected as soon as the next real
+                 * report arrives, which is always-immediately because each
+                 * physical stick movement generates a report. */
+                if (is_logitech) {
+                    if (cache_valid && ++no_data_count >= CACHE_DECAY_ITERS) {
+                        cached_pad.buttons         = 0;
+                        cached_pad.analogButtons.l2 = 0;
+                        cached_pad.analogButtons.r2 = 0;
+                    }
+                    if (cache_valid) inject_pad(slot, &cached_pad);
+                }
+                continue;
+            }
+        }
+
+        memset(&complete,0,sizeof(complete)); complete.ep_index=0;
+        if (ioctl(fd,USB_FS_COMPLETE,&complete) != 0) {
+            int e = errno;
+            if (e == ENXIO || e == ENOTTY) {
+                gp_log("slot[%d] COMPLETE errno=%d — gone\n", slot, e);
+                goto reinit;
+            }
+            /* EBUSY here means "nothing actually ready right now" — loop
+             * back to poll and wait again. */
             continue;
         }
 
-        int ok=0, cerr=0, cw=0;
-        for(cw=0;cw<60;cw++){
-            memset(&complete,0,sizeof(complete)); complete.ep_index=0;
-            if(ioctl(fd,USB_FS_COMPLETE,&complete)==0){ok=1;break;}
-            cerr=errno;
-            if(cerr==ENXIO||cerr==ENOTTY){gp_log("slot[%d] COMPLETE errno=%d — gone\n",slot,cerr);goto reinit;}
-            if(cerr!=EBUSY) break;
-            usleep(500);
-        }
-        if(!ok){
-            memset(&stop,0,sizeof(stop)); stop.ep_index=0; ioctl(fd,USB_FS_STOP,&stop);
-            continue;
-        }
-        if(lengths[0]<1) continue;
+        if (eps[0].aFrames == 0 || lengths[0] < 1) continue;
 
+        /* Use the first frame slot — kernel writes the newest received
+         * report there. Other slots (1..nFrames-1) may stay zeroed for
+         * the iteration if fewer reports arrived than slots queued, and
+         * reading those would give all-zero "stick at min + dpad north"
+         * stuck-input garbage. */
+        const uint8_t *parse_buf = (const uint8_t *)buffers[0];
         uint32_t len = lengths[0];
 
         ScePadData pad; memset(&pad,0,sizeof(pad)); pad.quat.w=1.0f;
         int injected = 0;
 
         if (is_ds4) {
-            injected = ds4_handle_packet(fd, eps, buf, len, &pad);
-        } else if (pid == PID_XBOX) {
-            injected = xbox_handle_packet(fd, eps, buf, len, &pad);
+            injected = ds4_handle_packet(fd, eps, parse_buf, len, &pad);
+        } else if (is_logitech) {
+            injected = logitech_handle_packet(fd, eps, parse_buf, len, &pad);
+        } else if (is_xbox) {
+            injected = xbox_handle_packet(fd, eps, parse_buf, len, &pad);
         } else {
-            injected = nintendo_handle_packet(fd, eps, buf, len, &hs_state, &nintendo_seq, &pad);
+            injected = nintendo_handle_packet(fd, eps, parse_buf, len, &hs_state, &nintendo_seq, &pad);
         }
 
         if (injected > 0) {
@@ -666,7 +757,22 @@ main_loop: ;
                 if (g_assign_slot == slot) g_assign_slot = -1;
                 gp_log("slot[%d] assignment confirmed (button press)\n", slot);
             }
+            /* Update the cache for sparse-report controllers and reset
+             * the decay counter — we just got fresh data. */
+            if (is_logitech) {
+                memcpy(&cached_pad, &pad, sizeof(cached_pad));
+                cache_valid = 1;
+                no_data_count = 0;
+            }
             inject_pad(slot, &pad);
+        }
+
+        /* Explicit stop after each successful read for Logitech — keeps
+         * the kernel in a clean state for the next USB_FS_START. Without
+         * this, the next start returns EBUSY and we lose ~5ms to a stop+
+         * sleep recovery, dropping reports (notably button releases). */
+        if (is_logitech) {
+            memset(&stop,0,sizeof(stop)); stop.ep_index=0; ioctl(fd,USB_FS_STOP,&stop);
         }
     }
 
@@ -760,12 +866,14 @@ static void *controller_manager_thread(void *arg) {
             }
 
             const char *name =
-                (vid==VID_SWITCH && pid==PID_SWITCH) ? "Nintendo Switch Pro / 8BitDo" :
-                (vid==VID_NATIVE && pid==PID_NATIVE) ? "8BitDo Native" :
-                (vid==VID_XBOX   && pid==PID_XBOX)   ? "Xbox One S" :
-                (vid==VID_SONY)                       ? "DualShock 4" :
-                (vid==VID_HORI)                       ? "HORIPAD / DS4-compatible (XIM4)" :
-                                                        "Unknown";
+                (vid==VID_SWITCH && pid==PID_SWITCH)        ? "Nintendo Switch Pro / 8BitDo" :
+                (vid==VID_NATIVE && pid==PID_NATIVE)        ? "8BitDo Native" :
+                (vid==VID_XBOX   && pid==PID_XBOX)          ? "Xbox One/Series" :
+                (vid==VID_SONY)                              ? "DualShock 4" :
+                (vid==VID_HORI)                              ? "HORIPAD / DS4-compatible (XIM4)" :
+                (vid==VID_LOGITECH)                          ? "Logitech RumblePad / DInput pad" :
+                ds4_is_compatible_vidpid(vid, pid)           ? "DS4-protocol third-party (SDL list)" :
+                                                               "Unknown";
 
             gp_log("manager: %s at %s → slot[%d]\n", name, path, slot);
             notify("Ghostcontrol: %s detected — assign user on screen", name);
