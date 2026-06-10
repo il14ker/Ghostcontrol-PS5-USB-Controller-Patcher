@@ -46,6 +46,7 @@
 #include "controller_nintendo.h"
 #include "controller_xbox.h"
 #include "controller_ds4.h"
+#include "controller_ds3.h"
 #include "controller_logitech.h"
 
 /* ── Logging ──────────────────────────────────────────────────────────── */
@@ -251,7 +252,15 @@ static int match_known_vidpid(uint16_t vid, uint16_t pid,
         *out_vid = vid; *out_pid = pid;
         return 1;
     }
-    /* DS4 / DS4-protocol third-parties — Sony, HORI, and SDL's full PS4
+    /* DS3 / PS3-protocol third-parties — Sony DS3, HORI PS3 pads, Mad Catz
+     * Alpha PS3, Qanba PS3 sticks, PDP/Afterglow PS3, Logitech Chillstream,
+     * etc. See DS3_EXTRA_PAIRS in controller_ds3.c. Checked BEFORE the DS4
+     * branch because Sony and HORI VIDs hit both lists. */
+    if (ds3_is_compatible_vidpid(vid, pid)) {
+        *out_vid = vid; *out_pid = pid;
+        return 1;
+    }
+    /* DS4 / DS4-protocol third-parties — Sony, HORI, plus the full PS4
      * VID/PID table (Mad Catz, Razer, Nacon, Brook, Qanba, Victrix, etc).
      * See DS4_EXTRA_PAIRS in controller_ds4.c. */
     if (ds4_is_compatible_vidpid(vid, pid)) {
@@ -455,6 +464,52 @@ static void *usb_hid_thread(void *arg) {
     gp_log("slot[%d] USB thread: %s VID=0x%04x PID=0x%04x\n",
            slot, dev_path, vid, pid);
 
+    /* ── DS3 / SIXAXIS + PS3-protocol third-parties ───────────────────
+     * Needs GET_REPORT(0xF2)+GET_REPORT(0xF5) on EP0 -- without these
+     * two control transfers the controller never streams input reports.
+     * Sony and HORI VIDs match DS4 too, so this branch MUST run before
+     * the DS4 open block below. */
+    if (ds3_is_compatible_vidpid(vid, pid)) {
+        fd = open(dev_path, O_RDWR);
+        if (fd < 0) { gp_log("slot[%d] DS3 open fail errno=%d\n", slot, errno); goto exit_slot; }
+
+        { int ii; for(ii=0;ii<4;ii++){int i2=ii; ioctl(fd,USB_IFACE_DRIVER_DETACH,&i2);} }
+        usleep(100000);
+
+        memset(eps,0,sizeof(eps)); memset(&init,0,sizeof(init));
+        init.pEndpoints=eps; init.ep_index_max=1;
+        if (ioctl(fd,USB_FS_INIT,&init)!=0){
+            gp_log("slot[%d] DS3 FS_INIT fail errno=%d\n",slot,errno);
+            close(fd); goto exit_slot;
+        }
+
+        /* Operational handshake on EP0 -- both GET_REPORTs must succeed
+         * before opening the interrupt IN, otherwise the device sits idle. */
+        if (ds3_set_operational_usb(fd) != 0) {
+            gp_log("slot[%d] DS3 set_operational failed\n", slot);
+            goto uninit_exit;
+        }
+
+        memset(&fs_open,0,sizeof(fs_open));
+        fs_open.ep_index=0; fs_open.ep_no=DS3_EP_IN;
+        fs_open.max_bufsize=64; fs_open.max_frames=1;
+        if (ioctl(fd,USB_FS_OPEN,&fs_open)!=0){
+            gp_log("slot[%d] DS3 IN fail errno=%d\n",slot,errno);
+            goto uninit_exit;
+        }
+        gp_log("slot[%d] DS3 IN ep=0x%02x maxpkt=%u\n",
+               slot, DS3_EP_IN, (unsigned)fs_open.max_packet_length);
+        in_mpkt = fs_open.max_packet_length ? fs_open.max_packet_length : 64;
+
+        n_frames = 1;
+        buffers[0]=buf; lengths[0]=in_mpkt;
+        eps[0].ppBuffer=buffers; eps[0].pLength=lengths; eps[0].nFrames=1;
+        eps[0].timeout=50; eps[0].flags=USB_FS_FLAG_SINGLE_SHORT_OK|USB_FS_FLAG_MULTI_SHORT_OK;
+
+        out_opened = 0;
+        goto main_loop;
+    }
+
     /* ── DS4 / HORIPAD / XIM4 / DS4-protocol third-parties / Logitech ──
      * Identical open flow for all of them: detach driver, try IN 0x84 then
      * fall back to 0x81. Logitech and HORI/XIM both land on 0x81 with no
@@ -628,10 +683,14 @@ static void *usb_hid_thread(void *arg) {
     }
 
 main_loop: ;
-    int is_ds4      = ds4_is_compatible_vidpid(vid, pid);
+    /* DS3 first: Sony and HORI VIDs match both DS3 and DS4 lists.
+     * Without this ordering DS3 packets would be parsed by the DS4 layout
+     * and produce garbage. */
+    int is_ds3      = ds3_is_compatible_vidpid(vid, pid);
+    int is_ds4      = !is_ds3 && ds4_is_compatible_vidpid(vid, pid);
     int is_logitech = (vid == VID_LOGITECH);
     int is_xbox     = (pid == PID_XBOX);
-    int hs_state    = (is_xbox || is_ds4 || is_logitech) ? HS_STREAMING : HS_WAIT_81_01;
+    int hs_state    = (is_xbox || is_ds3 || is_ds4 || is_logitech) ? HS_STREAMING : HS_WAIT_81_01;
     uint8_t nintendo_seq = 1;
     g_slots[slot].usb_fd = fd;  /* register fd for clean teardown on SIGTERM */
 
@@ -735,7 +794,9 @@ main_loop: ;
         ScePadData pad; memset(&pad,0,sizeof(pad)); pad.quat.w=1.0f;
         int injected = 0;
 
-        if (is_ds4) {
+        if (is_ds3) {
+            injected = ds3_handle_packet(fd, eps, parse_buf, len, &pad);
+        } else if (is_ds4) {
             injected = ds4_handle_packet(fd, eps, parse_buf, len, &pad);
         } else if (is_logitech) {
             injected = logitech_handle_packet(fd, eps, parse_buf, len, &pad);
@@ -869,10 +930,12 @@ static void *controller_manager_thread(void *arg) {
                 (vid==VID_SWITCH && pid==PID_SWITCH)        ? "Nintendo Switch Pro / 8BitDo" :
                 (vid==VID_NATIVE && pid==PID_NATIVE)        ? "8BitDo Native" :
                 (vid==VID_XBOX   && pid==PID_XBOX)          ? "Xbox One/Series" :
+                (vid==VID_SONY   && pid==PID_DS3)           ? "DualShock 3 / SIXAXIS" :
+                ds3_is_compatible_vidpid(vid, pid)          ? "PS3-protocol third-party" :
                 (vid==VID_SONY)                              ? "DualShock 4" :
                 (vid==VID_HORI)                              ? "HORIPAD / DS4-compatible (XIM4)" :
                 (vid==VID_LOGITECH)                          ? "Logitech RumblePad / DInput pad" :
-                ds4_is_compatible_vidpid(vid, pid)           ? "DS4-protocol third-party (SDL list)" :
+                ds4_is_compatible_vidpid(vid, pid)           ? "DS4-protocol third-party" :
                                                                "Unknown";
 
             gp_log("manager: %s at %s → slot[%d]\n", name, path, slot);
