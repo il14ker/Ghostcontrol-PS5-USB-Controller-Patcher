@@ -37,13 +37,15 @@ https://github.com/user-attachments/assets/6583b1c2-3d3d-4f2e-9e79-689121fea4a3
 
 ## Supported Controllers
 
+**Full matrix:** [Supported_controllers.md](Supported_controllers.md) — detection rules, endpoints, ignored devices, and Manba vs 8BitDo notes.
+
 | Controller | Mode | VID:PID | Status |
 |-----------|------|---------|--------|
 | 8BitDo Ultimate 2 | Nintendo Switch Pro | 057e:2009 | ✅ Working |
 | 8BitDo Ultimate 2 | Native | 2dc8:310b | Untested |
 | 8BitDo Ultimate 2C Wireless (81HD) | XInput | 2dc8:310a | ✅ Working |
 
-See `othercontrollersGuide.md` for adding new controllers.
+See [othercontrollersGuide.md](othercontrollersGuide.md) for adding new controllers.
 
 ---
 
@@ -92,6 +94,8 @@ See `ProControllerResearch.md` for the full research documentation on the USB HI
 | `Makefile` | Build system |
 | `ghost-control-ps5.elf` | Pre-compiled payload (deploy directly) |
 | `ProControllerResearch.md` | Full USB protocol research for Nintendo Switch Pro Controller |
+| `Supported_controllers.md` | Compatibility matrix (source of truth) |
+| `CHANGELOG.md` | Release history |
 | `othercontrollersGuide.md` | Guide for adding other USB HID controllers |
 
 ---
