@@ -5,22 +5,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      
+
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y build-essential git
-      
-      - name: Clone PS5 SDK
         run: |
-          git clone https://github.com/ps5-payload-dev/sdk.git ~/ps5-payload-sdk
-          cd ~/ps5-payload-sdk
-          git submodule update --init --recursive
-      
+          sudo apt-get update
+          sudo apt-get install -y build-essential git wget unzip
+
+      - name: Download and install PS5 SDK
+        run: |
+          wget https://github.com/ps5-payload-dev/sdk/releases/latest/download/ps5-payload-sdk.zip
+          sudo mkdir -p /opt/ps5-payload-sdk
+          sudo unzip -o ps5-payload-sdk.zip -d /opt/ps5-payload-sdk
+
       - name: Build
         run: |
-          export PS5_PAYLOAD_SDK=~/ps5-payload-sdk
+          export PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
           cd payload
           make clean all
-      
+
       - name: Upload ELF
         uses: actions/upload-artifact@v4
         with:
