@@ -18,7 +18,7 @@ jobs:
           cd payload
           make clean all
       - name: Upload ELF
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: ghost-control-ps5
           path: payload/ghost-control-*.elf
