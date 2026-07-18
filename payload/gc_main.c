@@ -400,7 +400,7 @@ static void inject_pad(int slot, const ScePadData *pad) {
  * Microsoft USB devices). */
 static int match_known_vidpid(uint16_t vid, uint16_t pid,
                               uint16_t *out_vid, uint16_t *out_pid) {
-    /* DS4 / Sony / HORI */
+    /* DS4 / Sony / HORI — DualShock 4, HORIPAD, XIM4 */
     if (vid == VID_SONY || vid == VID_HORI) {
         *out_vid = vid; *out_pid = pid;
         return 1;
